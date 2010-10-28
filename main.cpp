@@ -23,7 +23,7 @@ static void *read_thread(void *param)
 
 	/* Handle all the events. */
 	while (!shutdown_thread) {
-        hid_read(dev, buf , sizeof(buf));
+        if (hid_read(dev, buf , sizeof(buf)) < 0) break;
 	}
 
 	return NULL;
