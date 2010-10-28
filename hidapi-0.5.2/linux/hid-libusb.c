@@ -11,8 +11,15 @@
 
  Copyright 2009, All Rights Reserved.
  
- This software may be used by anyone for any reason so
- long as this copyright notice remains intact.
+ At the discretion of the user of this library,
+ this software may be licensed under the terms of the
+ GNU Public License v3, a BSD-Style license, or the
+ original HIDAPI license as outlined in the LICENSE.txt,
+ LICENSE-gpl3.txt, LICENSE-bsd.txt, and LICENSE-orig.txt
+ files located at the root of the source distribution.
+ These files may also be found in the public source
+ code repository located at:
+        http://github.com/signal11/hidapi .
 ********************************************************/
 
 /* C */
@@ -37,6 +44,10 @@
 #include "iconv.h"
 
 #include "hidapi.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* Linked List of input reports received from the device. */
 struct input_report {
@@ -70,6 +81,7 @@ struct hid_device_ {
 	pthread_t thread;
 	pthread_mutex_t mutex; /* Protects input_reports */
 	pthread_cond_t condition;
+	pthread_barrier_t barrier; /* Ensures correct startup sequence */
 	int shutdown_thread;
 	struct libusb_transfer *transfer;
 
@@ -79,10 +91,10 @@ struct hid_device_ {
 
 static int initialized = 0;
 
-uint16_t get_usb_code_for_current_locale();
+uint16_t get_usb_code_for_current_locale(void);
 static int return_data(hid_device *dev, unsigned char *data, size_t length);
 
-hid_device *new_hid_device()
+static hid_device *new_hid_device(void)
 {
 	hid_device *dev = calloc(1, sizeof(hid_device));
 	dev->device_handle = NULL;
@@ -93,15 +105,27 @@ hid_device *new_hid_device()
 	dev->manufacturer_index = 0;
 	dev->product_index = 0;
 	dev->serial_index = 0;
-	dev->blocking = 0;
+	dev->blocking = 1;
 	dev->shutdown_thread = 0;
 	dev->transfer = NULL;
 	dev->input_reports = NULL;
 	
 	pthread_mutex_init(&dev->mutex, NULL);
 	pthread_cond_init(&dev->condition, NULL);
+	pthread_barrier_init(&dev->barrier, NULL, 2);
 	
 	return dev;
+}
+
+static void free_hid_device(hid_device *dev)
+{
+	/* Clean up the thread objects */
+	pthread_barrier_destroy(&dev->barrier);
+	pthread_cond_destroy(&dev->condition);
+	pthread_mutex_destroy(&dev->mutex);
+
+	/* Free the device itself */
+	free(dev);
 }
 
 static void register_error(hid_device *device, const char *op)
@@ -158,7 +182,7 @@ static int is_language_supported(libusb_device_handle *dev, uint16_t lang)
 /* This function returns a newly allocated wide string containing the USB
    device string numbered by the index. The returned string must be freed
    by using free(). */
-static wchar_t *get_usb_string(libusb_device_handle *dev, uint8_t index)
+static wchar_t *get_usb_string(libusb_device_handle *dev, uint8_t idx)
 {
 	char buf[512];
 	int len;
@@ -181,7 +205,7 @@ static wchar_t *get_usb_string(libusb_device_handle *dev, uint8_t index)
 		
 	/* Get the string from libusb. */
 	len = libusb_get_string_descriptor(dev,
-			index,
+			idx,
 			lang,
 			(unsigned char*)buf,
 			sizeof(buf));
@@ -195,7 +219,7 @@ static wchar_t *get_usb_string(libusb_device_handle *dev, uint8_t index)
 	
 	/* Initialize iconv. */
 	ic = iconv_open("UTF-32", "UTF-16");
-	if (ic < 0)
+	if (ic == (iconv_t)-1)
 		return NULL;
 	
 	/* Convert to UTF-32 (wchar_t on glibc systems).
@@ -205,11 +229,11 @@ static wchar_t *get_usb_string(libusb_device_handle *dev, uint8_t index)
 	outptr = (char*) wbuf;
 	outbytes = sizeof(wbuf);
 	res = iconv(ic, &inptr, &inbytes, &outptr, &outbytes);
-	if (res < 0)
+	if (res == (size_t)-1)
 		goto err;
 
 	/* Write the terminating NULL. */
-	wbuf[sizeof(wbuf)-1] = 0x00000000;
+	wbuf[sizeof(wbuf)/sizeof(wbuf[0])-1] = 0x00000000;
 	if (outbytes >= sizeof(wbuf[0]))
 		*((wchar_t*)outptr) = 0x00000000;
 	
@@ -467,6 +491,9 @@ static void *read_thread(void *param)
 	/* Make the first submission. Further submissions are made
 	   from inside read_callback() */
 	libusb_submit_transfer(dev->transfer);
+
+	// Notify the main thread that the read thread is up and running.
+	pthread_barrier_wait(&dev->barrier);
 	
 	/* Handle all the events. */
 	while (!dev->shutdown_thread) {
@@ -481,12 +508,14 @@ static void *read_thread(void *param)
 			break;
 		}
 	}
+	
+	/* Cancel any transfer that may be pending. This call will fail
+	   if no transfers are pending, but that's OK. */
+	libusb_cancel_transfer(dev->transfer);
 
-#if 0 // This is done in hid_close()
 	/* Cleanup before returning */
 	free(dev->transfer->buffer);
 	libusb_free_transfer(dev->transfer);
-#endif
 	
 	return NULL;
 }
@@ -502,7 +531,7 @@ hid_device * HID_API_EXPORT hid_open_path(const char *path)
 	libusb_device *usb_dev;
 	ssize_t num_devs;
 	int res;
-	int i = 0;
+	int d = 0;
 	int good_open = 0;
 	
 	setlocale(LC_ALL,"");
@@ -513,7 +542,7 @@ hid_device * HID_API_EXPORT hid_open_path(const char *path)
 	}
 	
 	num_devs = libusb_get_device_list(NULL, &devs);
-	while ((usb_dev = devs[i++]) != NULL) {
+	while ((usb_dev = devs[d++]) != NULL) {
 		struct libusb_device_descriptor desc;
 		struct libusb_config_descriptor *conf_desc = NULL;
 		int i,j,k;
@@ -592,6 +621,9 @@ hid_device * HID_API_EXPORT hid_open_path(const char *path)
 						
 						pthread_create(&dev->thread, NULL, read_thread, dev);
 						
+						// Wait here for the read thread to be initialized.
+						pthread_barrier_wait(&dev->barrier);
+						
 					}
 					free(dev_path);
 				}
@@ -610,7 +642,7 @@ hid_device * HID_API_EXPORT hid_open_path(const char *path)
 	}
 	else {
 		// Unable to open any devices.
-		free(dev);
+		free_hid_device(dev);
 		return NULL;
 	}
 }
@@ -720,7 +752,7 @@ int HID_API_EXPORT hid_set_nonblocking(hid_device *dev, int nonblock)
 {
 	dev->blocking = !nonblock;
 	
-	return -1;
+	return 0;
 }
 
 
@@ -791,10 +823,14 @@ void HID_API_EXPORT hid_close(hid_device *dev)
 		return;
 	
 	/* Cause read_thread() to stop. */
+	dev->shutdown_thread = 1;
 	libusb_cancel_transfer(dev->transfer);
 
 	/* Wait for read_thread() to end. */
 	pthread_join(dev->thread, NULL);
+	
+	/* release the interface */
+	libusb_release_interface(dev->device_handle, dev->interface);
 	
 	/* Close the handle */
 	libusb_close(dev->device_handle);
@@ -806,11 +842,7 @@ void HID_API_EXPORT hid_close(hid_device *dev)
 	}
 	pthread_mutex_unlock(&dev->mutex);
 	
-	/* Clean up the thread objects */
-	pthread_mutex_destroy(&dev->mutex);
-	pthread_cond_destroy(&dev->condition);
-	
-	free(dev);
+	free_hid_device(dev);
 }
 
 
@@ -995,7 +1027,7 @@ static struct lang_map_entry lang_map[] = {
 	LANG(NULL, NULL, 0x0),	
 };
 
-uint16_t get_usb_code_for_current_locale()
+uint16_t get_usb_code_for_current_locale(void)
 {
 	char *locale;
 	char search_string[64];
@@ -1057,3 +1089,6 @@ uint16_t get_usb_code_for_current_locale()
 	return 0x0;
 }
 
+#ifdef __cplusplus
+}
+#endif
