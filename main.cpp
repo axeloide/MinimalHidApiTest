@@ -7,32 +7,10 @@
 
 using namespace std;
 
-pthread_t thread;
-pthread_barrier_t barrier; /* Ensures correct startup sequence */
-int shutdown_thread;
-
-
-static void *read_thread(void *param)
-{
-	hid_device *dev = (hid_device *) param;
-	unsigned char buf[255];
-
-
-	// Notify the main thread that the read thread is up and running.
-	pthread_barrier_wait(&barrier);
-
-	/* Handle all the events. */
-	while (!shutdown_thread) {
-        hid_read(dev, buf , sizeof(buf));
-	}
-
-	return NULL;
-}
-
 int main(int argc, char* argv[])
 {
 	int res;
-	unsigned char buf[65];
+	unsigned char buf[255];
 	#define MAX_STR 255
 	wchar_t wstr[MAX_STR];
 	hid_device *handle;
@@ -52,14 +30,6 @@ int main(int argc, char* argv[])
         printf("Could not set device handle to non-blocking!");
         return -1;
     }
-
-    // Start a Thread that will poll for input reports
-    shutdown_thread = 0;
-    pthread_barrier_init(&barrier, NULL, 2);
-    pthread_create(&thread, NULL, read_thread, handle);
-    // Wait here for the read thread to be initialized.
-    pthread_barrier_wait(&barrier);
-
 
 	// Read the Manufacturer String
 	res = hid_get_manufacturer_string(handle, wstr, MAX_STR);
@@ -85,37 +55,29 @@ int main(int argc, char* argv[])
 
 
     while (1) {
+
+        /*
         // Read a Feature Report from the device
         buf[0] = 0x1;
         res = hid_get_feature_report(handle, buf, sizeof(buf));
-
         if (res<0) {
             printf("Getting feature report failed with: %d\n",res);
             break;
         }
+        */
 
-        if (res>0) {
-            printf(".");
-            fflush(stdout);
-
-            // Print out the returned buffer.
-//            printf("Feature Report\n   ");
-//            for (int i = 0; i < res; i++)
-//                printf("0x%02hx ", buf[i]);
-//            printf("\n");
+        // Read a Input Report from the device
+        res = hid_read(handle, buf , sizeof(buf));
+        if (res<0) {
+            printf("Reading an input-report failed with: %d\n",res);
+            break;
         }
 
     }
 
-    // Signal thread to stop.
-	shutdown_thread = 1;
-
-	// Wait for thread to stop
-	pthread_join(thread, NULL);
-
     hid_close(handle);
 
-    getchar();
+    //getchar();
 
 	return 0;
 }
